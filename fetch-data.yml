@@ -1,0 +1,75 @@
+name: fetch-nbm-data
+
+on:
+  schedule:
+    # Anchored on 19:30Z, 6-hour cadence -> 01:30, 07:30, 13:30, 19:30 UTC.
+    - cron: '30 1,7,13,19 * * *'
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab to test
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # eccodes is a C library, not just a Python package — apt provides the shared lib that the
+      # eccodes-python bindings (installed via pip below) load at import time.
+      - name: Install eccodes system library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sanity-check eccodes is actually importable
+        run: python -c "import eccodes; print('eccodes OK, API version', eccodes.codes_get_api_version())"
+
+      - name: Run nbmdata.py
+        run: python nbmdata.py
+
+      - name: Move output into docs/ for Pages
+        run: |
+          mkdir -p docs
+          mv nbm_qmd_output_*.json.gz docs/
+
+      - name: Prune outputs older than 5 days
+        # Retention window is generous on purpose: the HTML pages look back up to 48h for the
+        # "current" run, and separately look back another ~24-48h behind THAT for the Trend
+        # baseline comparison. 5 days of headroom means neither lookup can ever come up empty
+        # because this step pruned something they still needed.
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re
+          from datetime import datetime, timezone
+
+          cutoff_hours = 5 * 24
+          now = datetime.now(timezone.utc)
+
+          for path in glob.glob("docs/nbm_qmd_output_*.json.gz"):
+              m = re.search(r"nbm_qmd_output_(\d{2})(\d{2})(\d{2})(\d{2})\.json\.gz", path)
+              if not m:
+                  continue
+              yy, mm, dd, hh = m.groups()
+              file_dt = datetime(2000 + int(yy), int(mm), int(dd), int(hh), tzinfo=timezone.utc)
+              age_hours = (now - file_dt).total_seconds() / 3600
+              if age_hours > cutoff_hours:
+                  print(f"Pruning {path} (age {age_hours:.0f}h)")
+                  os.remove(path)
+          EOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "nbm-data-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "data: NBM QMD update $(date -u +'%Y-%m-%d %H:%MZ')"
+          git push
