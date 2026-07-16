@@ -1,0 +1,46 @@
+name: keepalive
+
+# Runs independently of the data-fetch workflow, on purpose. If that workflow ever breaks and
+# stops producing commits, this is what keeps the repo from going 60 days without activity and
+# having GitHub auto-disable ALL scheduled workflows (including the data one you're trying to
+# protect). Only real commits count as "activity" toward that 60-day clock — tags, releases,
+# issues, and PRs do not.
+on:
+  schedule:
+    # Once a week is plenty; the disable threshold is 60 days, so this only needs to fire well
+    # inside that window. Avoid :00 — GitHub's shared runner fleet has heavy contention right on
+    # the hour, which can delay or occasionally drop a scheduled run.
+    - cron: '13 5 * * SUN'
+  workflow_dispatch: {}   # lets you trigger it manually to verify it works
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Touch a marker file if no recent commits
+        run: |
+          # Only commit if the most recent commit on this branch is already >40 days old.
+          # This keeps the keepalive job from adding noise commits every single week —
+          # it only acts when it's actually needed.
+          last_commit_epoch=$(git log -1 --format=%ct)
+          now_epoch=$(date +%s)
+          age_days=$(( (now_epoch - last_commit_epoch) / 86400 ))
+
+          echo "Last commit was $age_days day(s) ago."
+
+          if [ "$age_days" -ge 40 ]; then
+            mkdir -p .github
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/.keepalive
+            git config user.name "keepalive-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add .github/.keepalive
+            git commit -m "chore: keepalive commit (repo inactive ${age_days}d) [skip ci]"
+            git push
+          else
+            echo "Repo has recent activity, nothing to do."
+          fi
