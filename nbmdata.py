@@ -163,7 +163,7 @@ def check_run_exists(run_dt: datetime) -> bool:
     # posts quickly) and f192 (the longest lead time this pipeline needs, and the slowest to
     # post). Checking f024 alone previously let the pipeline lock onto a run that looked live
     # but hadn't finished posting its longer lead times yet, silently truncating day 8.
-    for probe_fhour in (24, 192):
+    for probe_fhour in (24, 228):
         url = build_nomads_url(run_dt, probe_fhour)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -544,7 +544,7 @@ def build_dataset() -> dict:
         72: anchor_forecast_hours(run_dt.hour, 12, 72)
     }
     
-    appt_fhours = list(range(1, 193))
+    appt_fhours = list(range(1, 229))
     all_qpf_hours = set(qpf_windows[24] + qpf_windows[48] + qpf_windows[72])
     all_target_hours = sorted(list(set(maxt_fhours + mint_fhours + appt_fhours + list(all_qpf_hours))))
     
@@ -578,8 +578,8 @@ def build_dataset() -> dict:
     log(f"=== Phase 1 complete: {len(downloaded_payloads)}/{total_steps} target hours downloaded ===")
     if missing_hours:
         log(f" Missing {len(missing_hours)} hour(s): {missing_hours}")
-    if 192 in all_target_hours and 192 not in downloaded_payloads:
-        log(" NOTE: f192 (longest lead time) did not come through this run.")
+    if 228 in all_target_hours and 228 not in downloaded_payloads:
+        log(" NOTE: f228 (longest lead time) did not come through this run.")
 
     log(f"=== Phase 2: Generating output dataset ===")
     for idx, f in enumerate(all_target_hours, 1):
