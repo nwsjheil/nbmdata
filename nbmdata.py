@@ -223,19 +223,181 @@ def maxt_valid_date(run_dt: datetime, f_hour: int):
 def mint_valid_date(run_dt: datetime, f_hour: int):
     return (run_dt + timedelta(hours=f_hour)).date()
 
-_city_indices_cache: list[int] | None = None
+_grid_box_cache: dict | None = None  # {"fingerprint": (...), "indices": {city_name: {"nearest": int, "box": [int,...]}}}
 
-def get_city_grid_indices(gid: int, cities: list[dict]) -> list[int]:
-    global _city_indices_cache
-    if _city_indices_cache is not None:
-        return _city_indices_cache
+_GRID_FINGERPRINT_KEYS = (
+    "Nx", "Ny", "jPointsAreConsecutive",
+    "latitudeOfFirstGridPointInDegrees", "longitudeOfFirstGridPointInDegrees",
+    "gridType",
+)
+
+# Cities to log full box contents for on every run, as a manual spot-check that the
+# 3x3 neighborhood is actually a compact square of physically adjacent grid cells
+# around the city -- one interior point, one nearer the domain edge.
+_DEBUG_SPOTCHECK_CITIES = {"Downtown Orlando (Orange)", "Melbourne* (Brevard)"}
+
+def _grid_fingerprint(gid: int) -> tuple:
+    """A cheap signature of the grid's geometry. If this ever differs between
+    messages/files within a run, cached flat-array indices from an earlier grid
+    are no longer valid and must not be reused."""
+    vals = []
+    for key in _GRID_FINGERPRINT_KEYS:
+        try:
+            vals.append(eccodes.codes_get(gid, key))
+        except Exception:
+            vals.append(None)
+    return tuple(vals)
+
+def _flat_to_rowcol(idx: int, nx: int, ny: int, j_consecutive: bool) -> tuple[int, int]:
+    if j_consecutive:
+        return idx % ny, idx // ny  # (row, col)
+    return idx // nx, idx % nx      # (row, col)
+
+def _rowcol_to_flat(row: int, col: int, nx: int, ny: int, j_consecutive: bool) -> int:
+    if j_consecutive:
+        return col * ny + row
+    return row * nx + col
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import radians, sin, cos, sqrt, atan2
+    r = 6371.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlmb = radians(lon2 - lon1)
+    a = sin(dphi / 2) ** 2 + cos(p1) * cos(p2) * sin(dlmb / 2) ** 2
+    return 2 * r * atan2(sqrt(a), sqrt(1 - a))
+
+def get_city_box_indices(gid: int, cities: list[dict]) -> dict[str, dict]:
+    """For each city, returns the flat index of the nearest grid point plus the
+    flat indices of the surrounding 3x3 box (fewer than 9 if the nearest point is
+    right at the edge of the cropped subregion domain). Cached for the run, but
+    keyed on a grid-geometry fingerprint: if a later message/file turns out to be
+    on a differently-shaped or differently-anchored grid, the cache is invalidated
+    and recomputed rather than silently reused."""
+    global _grid_box_cache
+
+    fingerprint = _grid_fingerprint(gid)
+
+    if _grid_box_cache is not None and _grid_box_cache["fingerprint"] == fingerprint:
+        return _grid_box_cache["indices"]
+
+    if _grid_box_cache is not None:
+        log(f" WARNING: grid geometry changed mid-run (was {_grid_box_cache['fingerprint']}, "
+            f"now {fingerprint}) -- recomputing city grid box indices.")
+
+    nx = eccodes.codes_get(gid, "Nx")
+    ny = eccodes.codes_get(gid, "Ny")
+    try:
+        j_consecutive = bool(eccodes.codes_get(gid, "jPointsAreConsecutive"))
+    except Exception:
+        j_consecutive = False
 
     lats = [c["lat"] for c in cities]
     lons = [c["lon"] for c in cities]
-
     nearest_points = eccodes.codes_grib_find_nearest_multiple(gid, False, lats, lons)
-    _city_indices_cache = [pt.index for pt in nearest_points]
-    return _city_indices_cache
+
+    grid_lats = eccodes.codes_get_array(gid, "latitudes")
+    grid_lons = eccodes.codes_get_array(gid, "longitudes")
+
+    # Don't just trust the semantic reading of jPointsAreConsecutive -- derive which
+    # axis actually varies fastest directly from the grid's own lat/lon arrays.
+    # Moving from flat index 0 to index 1 either shifts latitude or shifts longitude;
+    # that's an observable fact about this specific file, not an assumption about
+    # what the WMO flag is supposed to mean. This is a hard, deterministic check
+    # (unlike the statistical step-consistency check below, which has a known blind
+    # spot on near-square grids) and takes precedence if the two disagree.
+    if len(grid_lats) > 1:
+        d_lat_01 = abs(grid_lats[1] - grid_lats[0])
+        d_lon_01 = abs(grid_lons[1] - grid_lons[0])
+        empirical_j_consecutive = d_lat_01 > d_lon_01
+        if empirical_j_consecutive != j_consecutive:
+            log(f" WARNING: eccodes reports jPointsAreConsecutive={j_consecutive}, but the "
+                f"grid's own lat/lon arrays disagree (index 0->1 moves lat by {d_lat_01:.5f} deg, "
+                f"lon by {d_lon_01:.5f} deg). Trusting the empirical evidence over the flag.")
+            j_consecutive = empirical_j_consecutive
+
+    # Secondary self-check below: on a projected grid, the immediate N/S/E/W neighbor
+    # of any point should be roughly one grid-step away, and that step size should be
+    # roughly the same for every city in a given direction. Kept as a second line of
+    # defense in case Nx/Ny themselves are wrong (which the empirical check above
+    # doesn't cover), even though it's weaker on near-square grids.
+
+    indices: dict[str, dict] = {}
+    # Track step distances separately per direction (x=E/W, y=N/S): a real projected
+    # grid can legitimately have a different step size in x vs y, so those two must
+    # not be pooled together, or a systemic wrong-direction bug can hide inside the
+    # blended spread. Within a single direction, though, step size should be tight
+    # and consistent across the whole domain.
+    x_steps: list[float] = []
+    y_steps: list[float] = []
+    per_city_dir_steps: dict[str, dict[str, list[float]]] = {}
+
+    for c, pt in zip(cities, nearest_points):
+        row, col = _flat_to_rowcol(pt.index, nx, ny, j_consecutive)
+        box = []
+        city_dir_steps = {"x": [], "y": []}
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                r, cc = row + dr, col + dc
+                if 0 <= r < ny and 0 <= cc < nx:
+                    member_idx = _rowcol_to_flat(r, cc, nx, ny, j_consecutive)
+                    box.append(member_idx)
+                    if abs(dr) + abs(dc) == 1:  # orthogonal (N/S/E/W) neighbor, not diagonal
+                        dist_km = _haversine_km(
+                            grid_lats[pt.index], grid_lons[pt.index],
+                            grid_lats[member_idx], grid_lons[member_idx],
+                        )
+                        if dc != 0:
+                            city_dir_steps["x"].append(dist_km)
+                            x_steps.append(dist_km)
+                        else:
+                            city_dir_steps["y"].append(dist_km)
+                            y_steps.append(dist_km)
+        indices[c["name"]] = {"nearest": pt.index, "box": box}
+        per_city_dir_steps[c["name"]] = city_dir_steps
+
+    geometry_ok = True
+    for direction, pooled in (("x/E-W", x_steps), ("y/N-S", y_steps)):
+        if not pooled:
+            continue
+        median_step = sorted(pooled)[len(pooled) // 2]
+        bad_cities = []
+        for name, dir_steps in per_city_dir_steps.items():
+            key = "x" if direction.startswith("x") else "y"
+            for d in dir_steps[key]:
+                if median_step > 0 and abs(d - median_step) / median_step > 0.2:
+                    bad_cities.append(name)
+                    break
+        if len(bad_cities) > max(1, len(cities) // 10):
+            geometry_ok = False
+            log(f" WARNING: box index geometry self-check FAILED in the {direction} direction. "
+                f"Median single-step distance is {median_step:.2f} km, but "
+                f"{len(bad_cities)}/{len(cities)} cities have an inconsistent step there "
+                f"(e.g. {bad_cities[:5]}). The row/col scan-order assumption "
+                f"(jPointsAreConsecutive={j_consecutive}, Nx={nx}, Ny={ny}) likely doesn't "
+                f"match this grid's actual layout -- box results are NOT trustworthy "
+                f"until this is fixed.")
+
+    if geometry_ok:
+        log(" Box index geometry self-check passed: step sizes are consistent across the domain.")
+
+    for c in cities:
+        if c["name"] in _DEBUG_SPOTCHECK_CITIES:
+            info = indices[c["name"]]
+            nearest_lat, nearest_lon = grid_lats[info["nearest"]], grid_lons[info["nearest"]]
+            nearest_dist = _haversine_km(c["lat"], c["lon"], nearest_lat, nearest_lon)
+            log(f" [spot-check] {c['name']}: target=({c['lat']:.4f},{c['lon']:.4f}) "
+                f"nearest_idx={info['nearest']} at ({nearest_lat:.4f},{nearest_lon:.4f}), "
+                f"{nearest_dist:.2f} km from target -- box has {len(info['box'])} members")
+            for member_idx in info["box"]:
+                m_lat, m_lon = grid_lats[member_idx], grid_lons[member_idx]
+                d_from_nearest = _haversine_km(nearest_lat, nearest_lon, m_lat, m_lon)
+                marker = " (=nearest)" if member_idx == info["nearest"] else ""
+                log(f"     idx={member_idx} lat={m_lat:.4f} lon={m_lon:.4f} "
+                    f"dist_from_nearest={d_from_nearest:.2f} km{marker}")
+
+    _grid_box_cache = {"fingerprint": fingerprint, "indices": indices}
+    return indices
 
 def decode_nomads_file(raw_bytes: bytes, cities: list[dict], f_hour: int | None = None) -> dict:
     if not raw_bytes or eccodes is None:
@@ -246,7 +408,7 @@ def decode_nomads_file(raw_bytes: bytes, cities: list[dict], f_hour: int | None 
         tmp_path = tmp.name
 
     extracted_data = {
-        "TMP_max": {}, "TMP_min": {}, "TMP_instant": {}, "APTMP": {},
+        "TMP_max": {}, "TMP_min": {}, "TMP_instant": {}, "APTMP_max": {}, "APTMP_min": {},
         "APCP_24": {}, "APCP_48": {}, "APCP_72": {}
     }
 
@@ -265,9 +427,19 @@ def decode_nomads_file(raw_bytes: bytes, cities: list[dict], f_hour: int | None 
                     if param not in ("2t", "max_2t", "min_2t", "aptmp", "tp"):
                         continue
 
-                    indices = get_city_grid_indices(gid, cities)
+                    box_indices = get_city_box_indices(gid, cities)
                     values = eccodes.codes_get_values(gid)
-                    city_samples = {c["name"]: float(values[idx]) for c, idx in zip(cities, indices)}
+
+                    # Nearest-point-only sample (used for QPF, which doesn't get box treatment)
+                    city_nearest = {c["name"]: float(values[box_indices[c["name"]]["nearest"]]) for c in cities}
+
+                    def city_box_extreme(reducer):
+                        return {
+                            c["name"]: float(reducer(values[i] for i in box_indices[c["name"]]["box"]))
+                            for c in cities
+                        }
+
+                    city_samples = city_nearest
 
                     if param == "tp":
                         try:
@@ -302,9 +474,11 @@ def decode_nomads_file(raw_bytes: bytes, cities: list[dict], f_hour: int | None 
                                 continue
 
                             if param == "max_2t":
-                                extracted_data["TMP_max"].setdefault(pct, city_samples)
+                                # Hottest value within each city's 3x3 grid-box neighborhood
+                                extracted_data["TMP_max"].setdefault(pct, city_box_extreme(max))
                             elif param == "min_2t":
-                                extracted_data["TMP_min"].setdefault(pct, city_samples)
+                                # Coldest value within each city's 3x3 grid-box neighborhood
+                                extracted_data["TMP_min"].setdefault(pct, city_box_extreme(min))
 
                         elif param == "2t":
                             continue
@@ -316,7 +490,10 @@ def decode_nomads_file(raw_bytes: bytes, cities: list[dict], f_hour: int | None 
                             #    log(f" [f{f_hour}] Skipped aptmp message: no percentileValue ({e})")
                                 continue
 
-                            extracted_data["APTMP"].setdefault(pct, city_samples)
+                            # Same hourly message feeds both the daily-high (hottest-in-box) and
+                            # daily-low (coldest-in-box) apparent-temp series downstream.
+                            extracted_data["APTMP_max"].setdefault(pct, city_box_extreme(max))
+                            extracted_data["APTMP_min"].setdefault(pct, city_box_extreme(min))
 
                 except Exception as e:
                     log(f" [f{f_hour}] Message failed: {e}")
@@ -445,51 +622,75 @@ def build_dataset() -> dict:
                             win_entry["exceed"][thresh_in] = round(prob_val, 1)
 
     log(f"=== Phase 3: Processing Daily Apparent Temperature Shifted CDFs ===")
-    temp_hourly_store = {c["name"]: {} for c in CITIES}
+    # Two parallel hourly series per city: the hottest-in-box reading (feeds the daily
+    # "highest high" apparent-temp CDF) and the coldest-in-box reading (feeds the daily
+    # "lowest low" apparent-temp CDF). These come from the same GRIB message per hour,
+    # just reduced across each city's 3x3 grid-box neighborhood in opposite directions.
+    temp_hourly_store_max = {c["name"]: {} for c in CITIES}
+    temp_hourly_store_min = {c["name"]: {} for c in CITIES}
     for f in appt_fhours:
         if f not in downloaded_payloads:
             continue
         hour_data = decode_nomads_file(downloaded_payloads[f], CITIES, f_hour=f)
-        if hour_data.get("APTMP"):
-            valid_str = (run_dt + timedelta(hours=f)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            for pct, city_vals in hour_data["APTMP"].items():
+        valid_str = (run_dt + timedelta(hours=f)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        if hour_data.get("APTMP_max"):
+            for pct, city_vals in hour_data["APTMP_max"].items():
                 for name, k in city_vals.items():
-                    temp_hourly_store[name].setdefault(valid_str, {"pcts": {}})
-                    temp_hourly_store[name][valid_str]["pcts"][pct] = round((k - 273.15) * 9 / 5 + 32, 1)
+                    temp_hourly_store_max[name].setdefault(valid_str, {"pcts": {}})
+                    temp_hourly_store_max[name][valid_str]["pcts"][pct] = round((k - 273.15) * 9 / 5 + 32, 1)
+
+        if hour_data.get("APTMP_min"):
+            for pct, city_vals in hour_data["APTMP_min"].items():
+                for name, k in city_vals.items():
+                    temp_hourly_store_min[name].setdefault(valid_str, {"pcts": {}})
+                    temp_hourly_store_min[name][valid_str]["pcts"][pct] = round((k - 273.15) * 9 / 5 + 32, 1)
+
+    def group_by_day(hourly_records: dict) -> dict:
+        groups: dict[str, list] = {}
+        for timestamp, payload in hourly_records.items():
+            day_str = timestamp.split("T")[0]
+            groups.setdefault(day_str, []).append(payload["pcts"])
+        return groups
+
+    def build_envelope(hourly_pct_list: list, pick) -> dict:
+        available_pcts = set()
+        for hour_pcts in hourly_pct_list:
+            for p_str in hour_pcts.keys():
+                available_pcts.add(int(p_str))
+
+        env = {}
+        for p in available_pcts:
+            p_str = str(p)
+            vals = [h[p_str] for h in hourly_pct_list if p_str in h]
+            if vals:
+                env[p] = pick(vals)
+        return env
 
     for name in dataset["cities"]:
         city_data = dataset["cities"][name]
-        
+
         if "appt_hourly" in city_data:
             del city_data["appt_hourly"]
-            
-        hourly_records = temp_hourly_store.get(name, {})
-        
-        daily_groups = {}
-        for timestamp, payload in hourly_records.items():
-            day_str = timestamp.split("T")[0]
-            daily_groups.setdefault(day_str, []).append(payload["pcts"])
-            
-        for day_str, hourly_pct_list in daily_groups.items():
-            available_pcts = set()
-            for hour_pcts in hourly_pct_list:
-                for p_str in hour_pcts.keys():
-                    available_pcts.add(int(p_str))
-            
-            max_envelope = {}
-            min_envelope = {}
-            for p in available_pcts:
-                p_str = str(p)
-                vals = [h[p_str] for h in hourly_pct_list if p_str in h]
-                if vals:
-                    max_envelope[p] = max(vals)
-                    min_envelope[p] = min(vals)
-            
-            p50_values = [h["50"] for h in hourly_pct_list if "50" in h]
-            
-            max_cdf = calculate_shifted_cdf(max_envelope, p50_values, is_heat=True)
-            min_cdf = calculate_shifted_cdf(min_envelope, p50_values, is_heat=False)
-            
+
+        max_daily_groups = group_by_day(temp_hourly_store_max.get(name, {}))
+        min_daily_groups = group_by_day(temp_hourly_store_min.get(name, {}))
+
+        for day_str in set(max_daily_groups) | set(min_daily_groups):
+            max_hourly_pct_list = max_daily_groups.get(day_str, [])
+            min_hourly_pct_list = min_daily_groups.get(day_str, [])
+
+            # Day's running max, per percentile, of the hottest-in-box hourly readings
+            max_envelope = build_envelope(max_hourly_pct_list, max)
+            # Day's running min, per percentile, of the coldest-in-box hourly readings
+            min_envelope = build_envelope(min_hourly_pct_list, min)
+
+            max_p50_values = [h["50"] for h in max_hourly_pct_list if "50" in h]
+            min_p50_values = [h["50"] for h in min_hourly_pct_list if "50" in h]
+
+            max_cdf = calculate_shifted_cdf(max_envelope, max_p50_values, is_heat=True)
+            min_cdf = calculate_shifted_cdf(min_envelope, min_p50_values, is_heat=False)
+
             city_data["appt_daily_cdf"][day_str] = {
                 "max_apparent_tw": max_cdf,
                 "min_apparent_tw": min_cdf
