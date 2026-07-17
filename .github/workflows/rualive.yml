@@ -1,0 +1,11 @@
+name: scheduler-test
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Scheduler is alive"
