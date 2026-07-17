@@ -210,7 +210,7 @@ def fetch_filtered_grib(run_dt: datetime, f_hour: int):
     except Exception as e:
         return b"", f"failed ({e})"
 
-def anchor_forecast_hours(run_hour: int, end_hour_utc: int, window_hours: int, n_periods: int = 8) -> list[int]:
+def anchor_forecast_hours(run_hour: int, end_hour_utc: int, window_hours: int, n_periods: int = 9) -> list[int]:
     base = (end_hour_utc - run_hour) % 24
     if base == 0:
         base = 24
